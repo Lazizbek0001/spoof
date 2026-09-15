@@ -41,12 +41,63 @@ REAL_LABEL = 1
 @lru_cache(maxsize=1)
 def get_antispoof_model() -> AntiSpoofPredict:
     """
-    Create AntiSpoofPredict only once.
+    Automatically use GPU when CUDA is available.
+    If GPU is not available, fall back to CPU.
 
-    device_id=0 means use device 0 according to the implementation
-    inside AntiSpoofPredict.
+    The selected device is printed once because this function
+    is cached with @lru_cache(maxsize=1).
     """
-    return AntiSpoofPredict(device_id=0)
+
+    runtime = get_antispoof_runtime_info()
+
+    if runtime["device"] == "GPU":
+        print("=" * 60)
+        print("[Anti-Spoof] GPU FOUND")
+        print(f"[Anti-Spoof] GPU name: {runtime['gpu_name']}")
+        print(f"[Anti-Spoof] Device: cuda:{runtime['device_id']}")
+        print(f"[Anti-Spoof] PyTorch: {runtime['torch_version']}")
+        print(f"[Anti-Spoof] CUDA: {runtime['cuda_version']}")
+        print("=" * 60)
+
+        device_id = runtime["device_id"]
+
+    else:
+        print("=" * 60)
+        print("[Anti-Spoof] GPU NOT FOUND")
+        print("[Anti-Spoof] Falling back to CPU")
+        print(f"[Anti-Spoof] PyTorch: {runtime['torch_version']}")
+
+        if runtime.get("error"):
+            print(f"[Anti-Spoof] Error: {runtime['error']}")
+
+        print("=" * 60)
+
+        device_id = 0
+
+    # AntiSpoofPredict should internally use:
+    #
+    #   cuda:<device_id>
+    #
+    # when torch.cuda.is_available() is True,
+    # otherwise it will use CPU.
+    predictor = AntiSpoofPredict(
+        device_id=device_id,
+    )
+
+    # Print the actual device selected by AntiSpoofPredict,
+    # if the class exposes a .device attribute.
+    actual_device = getattr(
+        predictor,
+        "device",
+        None,
+    )
+
+    if actual_device is not None:
+        print(
+            f"[Anti-Spoof] Actual inference device: {actual_device}"
+        )
+
+    return predictor
 
 
 @lru_cache(maxsize=1)
