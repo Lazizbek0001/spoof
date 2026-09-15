@@ -21,7 +21,10 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from pydantic import BaseModel
+import os
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 from deepface import DeepFace
 
 # Your anti-spoof + liveness modules
