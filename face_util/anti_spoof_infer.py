@@ -6,7 +6,7 @@ from typing import Tuple
 
 import cv2
 import numpy as np
-
+from .gpu_utils import get_antispoof_runtime_info
 from .src.anti_spoof_predict import AntiSpoofPredict
 from .src.generate_patches import CropImage
 from .src.utility import parse_model_name
