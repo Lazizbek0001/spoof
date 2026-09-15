@@ -1,0 +1,30 @@
+# ============================================================
+# requirements-gpu.txt
+# GPU environment (NVIDIA GPU, CUDA 12.x driver required)
+# Linux only (Windows needs WSL2 for TF GPU support)
+# Tested with: Python 3.11 / 3.12
+# ============================================================
+
+# --- Core web / app ---
+numpy==1.26.4
+opencv-python==4.10.0.84
+Pillow==10.4.0
+
+# --- Anti-spoofing model (CPU PyTorch) ---
+# NOTE: We intentionally use CPU-only torch here.
+#       The anti-spoof code (AntiSpoofPredict) forces CPU anyway,
+#       and installing torch with CUDA would conflict with
+#       TensorFlow's CUDA library versions (nvidia-cublas-cu12).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu
+torchvision==0.19.1+cpu
+
+# --- Face recognition (DeepFace + TensorFlow GPU) ---
+deepface==0.0.93
+tf-keras==2.17.0
+tensorflow[and-cuda]==2.17.0
+
+# --- DeepFace optional deps (RetinaFace detector) ---
+retina-face==0.0.17
+gdown==5.2.0
+mtcnn==0.1.1
