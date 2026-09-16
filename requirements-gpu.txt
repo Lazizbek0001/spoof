@@ -1,30 +1,51 @@
 # ============================================================
-# requirements-gpu.txt
-# GPU environment (NVIDIA GPU, CUDA 12.x driver required)
-# Linux only (Windows needs WSL2 for TF GPU support)
-# Tested with: Python 3.11 / 3.12
+# FastAPI
 # ============================================================
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+gunicorn==26.2.0
+python-multipart==0.0.32
+websockets==17.1
+pydantic==2.13.5
 
-# --- Core web / app ---
+# ============================================================
+# Computer vision
+# ============================================================
 numpy==1.26.4
 opencv-python==4.10.0.84
 Pillow==10.4.0
 
-# --- Anti-spoofing model (CPU PyTorch) ---
-# NOTE: We intentionally use CPU-only torch here.
-#       The anti-spoof code (AntiSpoofPredict) forces CPU anyway,
-#       and installing torch with CUDA would conflict with
-#       TensorFlow's CUDA library versions (nvidia-cublas-cu12).
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1+cpu
-torchvision==0.19.1+cpu
+# ============================================================
+# PyTorch GPU
+# RTX 50-series / Blackwell / CUDA 12.8
+# ============================================================
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-# --- Face recognition (DeepFace + TensorFlow GPU) ---
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
+
+# ============================================================
+# TensorFlow GPU
+# 2.20 is chosen because its NVIDIA dependencies can coexist
+# with PyTorch 2.7.1's NCCL version.
+# ============================================================
+tensorflow[and-cuda]==2.20.0
+tf-keras==2.20.1
+
+# ============================================================
+# Face recognition
+# ============================================================
 deepface==0.0.93
-tf-keras==2.17.0
-tensorflow[and-cuda]==2.17.0
-
-# --- DeepFace optional deps (RetinaFace detector) ---
 retina-face==0.0.17
-gdown==5.2.0
 mtcnn==0.1.1
+
+# ============================================================
+# Utilities
+# ============================================================
+requests==2.34.2
+python-dotenv==1.2.3
+PyYAML==6.0.3
+tqdm==4.70.1
+typing_extensions>=4.16.0
+python-dotenv==1.2.3

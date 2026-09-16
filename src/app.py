@@ -1,12 +1,14 @@
 import asyncio
 import base64
+import os
+import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-
+from dotenv import load_dotenv
 import cv2
 import numpy as np
 from fastapi import (
@@ -21,10 +23,6 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from pydantic import BaseModel
-import os
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 from deepface import DeepFace
 
 # Your anti-spoof + liveness modules
@@ -80,18 +78,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-@app.get("/debug/routes")
-async def debug_routes():
-    return [
-        {
-            "path": r.path,
-            "methods": list(getattr(r, "methods", [])),
-            "name": r.name,
-            "type": type(r).__name__,
-        }
-        for r in app.routes
-    ]
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -302,8 +288,12 @@ def _run_liveness_on_frame(image_bytes: bytes) -> dict:
 # ---------------------------------------------------------------------------
 # Optional: static API key check (skip if you already have auth)
 # ---------------------------------------------------------------------------
-API_KEY = "CHANGE_ME"  # override via env in production
+load_dotenv()
 
+API_KEY = os.getenv("API_KEY")
+
+if not API_KEY:
+    raise RuntimeError("API_KEY is not configured")
 
 def _check_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     if API_KEY and API_KEY != "CHANGE_ME" and x_api_key != API_KEY:
@@ -315,77 +305,130 @@ def _check_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/stream")
 async def ws_stream(websocket: WebSocket):
-    """
-    WebSocket streaming endpoint.
+    MAX_CONNECTION_SECONDS = 30.0
+    client_api_key = websocket.headers.get("x-api-key")
 
-    Protocol (JSON messages, both directions):
+    if (
+        not client_api_key
+        or not secrets.compare_digest(client_api_key, API_KEY)
+    ):
+        await websocket.close(
+            code=1008,
+            reason="Invalid API key",
+        )
+        return
 
-      Client -> Server:
-        {
-          "type": "frame",
-          "session_id": "abc-123",       # any string, device-generated
-          "frame": "<base64 or data URI>",
-          "frame_index": 42              # optional, for debugging
-        }
-        {
-          "type": "reset"
-        }
-        {
-          "type": "close"
-        }
-
-      Server -> Client:
-        {
-          "type": "ack",
-          "frame_index": 42,
-          "is_real": true,
-          "score": 0.93,
-          "reason": "label=0,real_score=0.9300",
-          "latency_ms": 47.2,
-          "decision": { ...LivenessSession decision... }
-        }
-        {
-          "type": "error",
-          "message": "..."
-        }
-
-    The client is expected to send frames at ~5–15 fps.
-    Server throttles: it processes every frame but caps in-flight work.
-    """
     await websocket.accept()
 
     session_id: Optional[str] = None
     session: Optional[LivenessSession] = None
     frame_counter = 0
+
     loop = asyncio.get_running_loop()
+
+    # 30-second timer starts when WebSocket is accepted
+    started_at = loop.time()
+    deadline = started_at + MAX_CONNECTION_SECONDS
 
     try:
         while True:
-            msg = await websocket.receive_json()
+            # ---------------------------------------------------------
+            # Calculate remaining connection time
+            # ---------------------------------------------------------
+            remaining = deadline - loop.time()
+
+            if remaining <= 0:
+                await websocket.send_json(
+                    {
+                        "type": "final",
+                        "ok": False,
+                        "reason": "connection_timeout",
+                        "message": "Liveness session exceeded 30 seconds.",
+                    }
+                )
+                break
+
+            # ---------------------------------------------------------
+            # Wait for message, but never longer than remaining time
+            # ---------------------------------------------------------
+            try:
+                msg = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=remaining,
+                )
+
+            except asyncio.TimeoutError:
+                await websocket.send_json(
+                    {
+                        "type": "final",
+                        "ok": False,
+                        "reason": "connection_timeout",
+                        "message": "Liveness session exceeded 30 seconds.",
+                    }
+                )
+                break
 
             mtype = msg.get("type")
 
+            # ---------------------------------------------------------
+            # RESET
+            # ---------------------------------------------------------
             if mtype == "reset":
+                if session_id:
+                    SESSIONS.pop(session_id, None)
+
                 session_id = None
                 session = None
                 frame_counter = 0
-                await websocket.send_json({"type": "reset_ok"})
-                continue
 
-            if mtype == "close":
-                await websocket.close()
-                return
+                # IMPORTANT:
+                # Timer is NOT restarted here.
+                # Maximum connection lifetime remains 30 seconds
+                # from websocket.accept().
 
-            if mtype != "frame":
                 await websocket.send_json(
-                    {"type": "error", "message": f"unknown_type:{mtype}"}
+                    {
+                        "type": "reset_ok",
+                        "remaining_seconds": round(
+                            max(0.0, deadline - loop.time()),
+                            2,
+                        ),
+                    }
                 )
                 continue
 
-            # ---- resolve session ----
-            sid = str(msg.get("session_id") or "default")
+            # ---------------------------------------------------------
+            # CLOSE
+            # ---------------------------------------------------------
+            if mtype == "close":
+                break
+
+            # ---------------------------------------------------------
+            # INVALID MESSAGE
+            # ---------------------------------------------------------
+            if mtype != "frame":
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "message": f"unknown_type:{mtype}",
+                    }
+                )
+                continue
+
+            # ---------------------------------------------------------
+            # Resolve session
+            # ---------------------------------------------------------
+            sid = str(
+                msg.get("session_id") or "default"
+            )
+
             if session is None or sid != session_id:
+                # Remove previous session if client changes session_id
+                if session_id and session_id != sid:
+                    SESSIONS.pop(session_id, None)
+
                 session_id = sid
+
                 session = SESSIONS.setdefault(
                     session_id,
                     LivenessSession(
@@ -396,29 +439,81 @@ async def ws_stream(websocket: WebSocket):
                     ),
                 )
 
-            # ---- decode frame ----
+            # ---------------------------------------------------------
+            # Decode frame
+            # ---------------------------------------------------------
             raw_b64 = msg.get("frame")
-            image_bytes = _decode_b64_to_bytes(raw_b64 or "")
+
+            image_bytes = _decode_b64_to_bytes(
+                raw_b64 or ""
+            )
+
             if not image_bytes:
                 await websocket.send_json(
-                    {"type": "error", "message": "bad_frame_encoding"}
+                    {
+                        "type": "error",
+                        "message": "bad_frame_encoding",
+                    }
                 )
                 continue
 
             frame_counter += 1
 
-            # ---- run liveness in thread pool ----
-            try:
-                result = await loop.run_in_executor(
-                    EXECUTOR, _run_liveness_on_frame, image_bytes
+            # ---------------------------------------------------------
+            # Check timeout again before inference
+            # ---------------------------------------------------------
+            remaining = deadline - loop.time()
+
+            if remaining <= 0:
+                await websocket.send_json(
+                    {
+                        "type": "final",
+                        "ok": False,
+                        "reason": "connection_timeout",
+                        "message": "Liveness session exceeded 30 seconds.",
+                    }
                 )
+                break
+
+            # ---------------------------------------------------------
+            # Run liveness
+            # ---------------------------------------------------------
+            try:
+                future = loop.run_in_executor(
+                    EXECUTOR,
+                    _run_liveness_on_frame,
+                    image_bytes,
+                )
+
+                # Inference is also bounded by the 30-second deadline
+                result = await asyncio.wait_for(
+                    future,
+                    timeout=remaining,
+                )
+
+            except asyncio.TimeoutError:
+                await websocket.send_json(
+                    {
+                        "type": "final",
+                        "ok": False,
+                        "reason": "connection_timeout",
+                        "message": "Liveness session exceeded 30 seconds.",
+                    }
+                )
+                break
+
             except Exception as e:
                 await websocket.send_json(
-                    {"type": "error", "message": f"liveness_error:{e}"}
+                    {
+                        "type": "error",
+                        "message": f"liveness_error:{e}",
+                    }
                 )
                 continue
 
-            # ---- feed session window ----
+            # ---------------------------------------------------------
+            # Add result to session
+            # ---------------------------------------------------------
             decision = session.add(
                 is_real=result["is_real"],
                 score=result["score"],
@@ -426,6 +521,16 @@ async def ws_stream(websocket: WebSocket):
                 frame_index=frame_counter,
             )
 
+            elapsed = loop.time() - started_at
+
+            remaining_seconds = max(
+                0.0,
+                deadline - loop.time(),
+            )
+
+            # ---------------------------------------------------------
+            # ACK
+            # ---------------------------------------------------------
             await websocket.send_json(
                 {
                     "type": "ack",
@@ -434,126 +539,64 @@ async def ws_stream(websocket: WebSocket):
                     "score": result["score"],
                     "reason": result["reason"],
                     "latency_ms": result["latency_ms"],
+                    "elapsed_seconds": round(elapsed, 2),
+                    "remaining_seconds": round(
+                        remaining_seconds,
+                        2,
+                    ),
                     "decision": decision,
                 }
             )
 
-            # Optional: auto-close the session when a decision is reached
-            if decision.get("ready") and decision.get("ok"):
+            # ---------------------------------------------------------
+            # PASS
+            # ---------------------------------------------------------
+            if (
+                decision.get("ready")
+                and decision.get("ok")
+            ):
                 await websocket.send_json(
-                    {"type": "final", "ok": True, "decision": decision}
+                    {
+                        "type": "final",
+                        "ok": True,
+                        "reason": "liveness_passed",
+                        "elapsed_seconds": round(
+                            elapsed,
+                            2,
+                        ),
+                        "decision": decision,
+                    }
                 )
-                # Don't close the socket — let client decide
+
+                # Authentication attempt is complete.
+                break
 
     except WebSocketDisconnect:
-        # normal client disconnect
         pass
+
     except Exception as e:
         try:
-            await websocket.send_json({"type": "error", "message": f"server_error:{e}"})
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": f"server_error:{e}",
+                }
+            )
         except Exception:
             pass
+
     finally:
+        # -------------------------------------------------------------
+        # Always remove session so old frames cannot affect next attempt
+        # -------------------------------------------------------------
+        if session_id:
+            SESSIONS.pop(session_id, None)
+
         try:
             await websocket.close()
         except Exception:
             pass
 
-
-# ---------------------------------------------------------------------------
-# HTTP fallback: single-shot liveness on a frame
-# ---------------------------------------------------------------------------
-class FrameRequest(BaseModel):
-    session_id: str
-    frame: str          # base64 or data URI
-    frame_index: Optional[int] = None
-
-
-@app.post("/stream/frame")
-async def stream_frame(
-    body: FrameRequest,
-    _: None = Depends(_check_api_key),
-):
-    """
-    HTTP fallback for devices that cannot use WebSockets.
-    Send one frame per request. Session state is kept in memory by session_id.
-    """
-    image_bytes = _decode_b64_to_bytes(body.frame)
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="bad_frame_encoding")
-
-    session = SESSIONS.setdefault(
-        body.session_id,
-        LivenessSession(
-            window_size=8,
-            min_real_frames=2,
-            min_avg_score=0.60,
-            required_real_ratio=0.30,
-        ),
-    )
-
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(EXECUTOR, _run_liveness_on_frame, image_bytes)
-
-    idx = body.frame_index if body.frame_index is not None else len(session.frames) + 1
-    decision = session.add(
-        is_real=result["is_real"],
-        score=result["score"],
-        reason=result["reason"],
-        frame_index=idx,
-    )
-
-    return {
-        "session_id": body.session_id,
-        "frame_index": idx,
-        "is_real": result["is_real"],
-        "score": result["score"],
-        "reason": result["reason"],
-        "latency_ms": result["latency_ms"],
-        "decision": decision,
-    }
-
-
-@app.delete("/stream/session/{session_id}")
-async def reset_session(
-    session_id: str,
-    _: None = Depends(_check_api_key),
-):
-    SESSIONS.pop(session_id, None)
-    return {"ok": True, "session_id": session_id}
-
-
-@app.get("/stream/sessions")
-async def list_sessions(_: None = Depends(_check_api_key)):
-    now = time.time()
-    return {
-        "count": len(SESSIONS),
-        "sessions": [
-            {
-                "session_id": sid,
-                "frames": len(s.frames),
-                "age_s": round(now - s.created_at, 1),
-            }
-            for sid, s in SESSIONS.items()
-        ],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Optional: existing image upload endpoint (kept for backward compat)
-# ---------------------------------------------------------------------------
-@app.post("/verify/liveness")
-async def verify_liveness(
-    file: UploadFile = File(...),
-    _: None = Depends(_check_api_key),
-):
-    image_bytes = await file.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty_file")
-
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(EXECUTOR, _run_liveness_on_frame, image_bytes)
-    return result
 
 
 @app.get("/health")
