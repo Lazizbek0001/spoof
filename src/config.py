@@ -12,10 +12,10 @@ class Settings:
     api_key: str
 
     max_connection_seconds: float = 30.0
-    max_workers: int = 4
+    max_workers: int = int(os.getenv("max_workers", 6))
 
-    min_frames: int = 12
-    min_real_frames: int = 8
+    window_size: int = 20
+    min_real_frames: int = 16
     min_avg_score: float = 0.90
     required_real_ratio: float = 0.80
 

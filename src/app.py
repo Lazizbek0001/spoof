@@ -92,7 +92,7 @@ app = FastAPI(
 
 def create_session() -> LivenessSession:
     return LivenessSession(
-        min_frames=settings.min_frames,
+        window_size=settings.window_size,
         min_real_frames=(
             settings.min_real_frames
         ),
@@ -355,29 +355,23 @@ async def ws_stream(
                 remaining=remaining,
             )
 
-            # -------------------------------------------------
-            # Hard screen/replay rejection
-            # -------------------------------------------------
-
-            if (
-                decision.get("reason")
-                == "screen_replay_detected"
-            ):
+            # ---------------------------------------------------------
+            # Hard rejection
+            # ---------------------------------------------------------
+            if decision.get("reason") == "screen_replay_detected":
                 await send_final(
                     websocket,
                     ok=False,
-                    reason=(
-                        "screen_replay_detected"
-                    ),
+                    reason="screen_replay_detected",
                     decision=decision,
                     elapsed=elapsed,
                 )
                 break
 
-            # -------------------------------------------------
-            # Successful liveness
-            # -------------------------------------------------
 
+            # ---------------------------------------------------------
+            # Successful liveness
+            # ---------------------------------------------------------
             if (
                 decision.get("ready")
                 and decision.get("ok")
