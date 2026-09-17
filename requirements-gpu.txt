@@ -49,3 +49,4 @@ PyYAML==6.0.3
 tqdm==4.70.1
 typing_extensions>=4.16.0
 python-dotenv==1.2.3
+mediapipe==1.0.1

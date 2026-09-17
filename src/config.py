@@ -11,7 +11,7 @@ load_dotenv()
 class Settings:
     api_key: str
 
-    max_connection_seconds: float = 30.0
+    max_connection_seconds: float = 60.0
     max_workers: int = int(os.getenv("max_workers", 6))
 
     window_size: int = 20

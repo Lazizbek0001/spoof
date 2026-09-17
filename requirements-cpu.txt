@@ -1,3 +1,14 @@
+# ============================================================
+# Package indexes
+# ============================================================
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+
+# ============================================================
+# Core
+# ============================================================
+
 absl-py==2.5.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -9,85 +20,160 @@ certifi==2026.7.22
 charset-normalizer==3.5.1
 click==8.5.0
 
-deepface==0.0.93
+
+# ============================================================
+# FastAPI / WebSocket
+# ============================================================
 
 fastapi==0.141.1
-filelock==3.32.6
-fire==0.7.1
-Flask==3.1.3
-flask-cors==6.0.5
-flatbuffers==25.12.19
-fsspec==2026.7.0
-gast==0.7.0
-gdown==5.2.0
-google-pasta==0.2.0
-grpcio==1.84.0
 gunicorn==26.2.0
 h11==0.16.0
-h5py==3.16.0
 httptools==0.8.0
-idna==3.19
-itsdangerous==2.2.0
-Jinja2==3.1.6
-keras==3.15.1
-libclang==18.1.1
-Markdown==3.10.3
-markdown-it-py==4.2.0
-MarkupSafe==3.0.3
-mdurl==0.1.2
-ml-dtypes==0.4.1
-mpmath==1.3.0
-mtcnn==0.1.1
-namex==0.1.0
-networkx==3.6.1
-numpy==1.26.4
-opencv-python==4.10.0.84
-opt_einsum==3.4.0
-optree==0.20.0
-packaging==26.3
-pandas==3.0.5
-pillow==10.4.0
-protobuf==4.25.9
 pydantic==2.13.5
 pydantic_core==2.46.5
-Pygments==2.21.0
-PySocks==1.7.1
-python-dateutil==2.9.0.post0
-python-dotenv==1.2.3
 python-multipart==0.0.32
-PyYAML==6.0.3
-requests==2.34.2
-retina-face==0.0.17
-rich==15.0.0
-setuptools==80.10.2
-six==1.17.0
-soupsieve==2.9.2
 starlette==1.6.0
-sympy==1.14.0
-
-tensorboard==2.17.1
-tensorboard-data-server==0.7.2
-tensorflow==2.17.1
-tf_keras==2.17.0
-
-termcolor==3.3.0
-
---index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1
-torchvision==0.19.1
-torchaudio==2.4.1
-
---extra-index-url https://pypi.org/simple
-
-tqdm==4.70.1
-typing-inspection==0.4.4
-typing_extensions==4.16.0
-urllib3==2.7.0
 uvicorn==0.53.0
 uvloop==0.22.1
 watchfiles==1.2.0
 websockets==17.1
-Werkzeug==3.1.8
-wheel==0.48.0
-wrapt==2.4.1
+
+
+# ============================================================
+# Environment
+# ============================================================
+
 python-dotenv==1.2.3
+
+
+# ============================================================
+# NumPy / Computer Vision
+# ============================================================
+
+numpy==1.26.4
+
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84
+
+pillow==10.4.0
+
+
+# ============================================================
+# MediaPipe / Face Actions
+# ============================================================
+
+mediapipe==1.0.1
+
+# Keep this below 1.4 because contourpy 1.4 requires NumPy 2.x
+contourpy==1.3.3
+
+matplotlib==3.11.2
+cycler==0.12.1
+fonttools==4.65.0
+kiwisolver==1.5.1
+pyparsing==3.3.2
+
+sounddevice==0.5.6
+cffi==2.1.1
+pycparser==3.0
+
+
+# ============================================================
+# DeepFace
+# ============================================================
+
+deepface==0.0.93
+retina-face==0.0.17
+mtcnn==0.1.1
+
+gdown==5.2.0
+
+
+# ============================================================
+# TensorFlow CPU
+# ============================================================
+
+tensorflow==2.17.1
+tf_keras==2.17.0
+
+tensorboard==2.17.1
+tensorboard-data-server==0.7.2
+
+keras==3.15.1
+
+flatbuffers==25.12.19
+gast==0.7.0
+google-pasta==0.2.0
+grpcio==1.84.0
+h5py==3.16.0
+libclang==18.1.1
+ml-dtypes==0.4.1
+namex==0.1.0
+opt_einsum==3.4.0
+optree==0.20.0
+protobuf==4.25.9
+termcolor==3.3.0
+wrapt==2.4.1
+
+
+# ============================================================
+# PyTorch CPU
+# ============================================================
+
+torch==2.4.1+cpu
+torchvision==0.19.1+cpu
+torchaudio==2.4.1+cpu
+
+
+# ============================================================
+# Flask / DeepFace dependencies
+# ============================================================
+
+Flask==3.1.3
+flask-cors==6.0.5
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+Werkzeug==3.1.8
+
+
+# ============================================================
+# Data / Utilities
+# ============================================================
+
+filelock==3.32.6
+fire==0.7.1
+fsspec==2026.7.0
+idna==3.19
+
+Markdown==3.10.3
+markdown-it-py==4.2.0
+mdurl==0.1.2
+
+mpmath==1.3.0
+networkx==3.6.1
+packaging==26.3
+pandas==3.0.5
+
+Pygments==2.21.0
+PySocks==1.7.1
+
+python-dateutil==2.9.0.post0
+
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+
+setuptools==80.10.2
+six==1.17.0
+soupsieve==2.9.2
+sympy==1.14.0
+
+tqdm==4.70.1
+
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+
+urllib3==2.7.0
+
+wheel==0.48.0
