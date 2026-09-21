@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
 from .gpu_utils import get_antispoof_runtime_info
 from .src.anti_spoof_predict import AntiSpoofPredict
 from .src.generate_patches import CropImage
-from .src.utility import parse_model_name
 
 
 MODEL_DIR = os.path.join(
@@ -18,20 +19,13 @@ MODEL_DIR = os.path.join(
     "anti_spoof_models",
 )
 
-
-# ---------------------------------------------------------------------------
-# MiniVision / Silent-Face-Anti-Spoofing class mapping
-#
-# IMPORTANT:
-# Original MiniVision pretrained anti-spoof models use:
-#
-#     class 1 = REAL / LIVE
-#
-# Other classes are spoof attacks.
-#
-# Do NOT use REAL_LABEL = 0 for the original pretrained MiniVision weights.
-# ---------------------------------------------------------------------------
+# Original MiniVision pretrained weights: class 1 = REAL / LIVE.
 REAL_LABEL = 1
+
+# Set ANTISPOOF_FP16=0 to disable half precision on the GPU.
+USE_FP16 = os.getenv("ANTISPOOF_FP16", "1").strip().lower() not in ("0", "false", "no")
+
+Result = Tuple[bool, float, str]
 
 
 # ---------------------------------------------------------------------------
@@ -41,103 +35,35 @@ REAL_LABEL = 1
 @lru_cache(maxsize=1)
 def get_antispoof_model() -> AntiSpoofPredict:
     """
-    Automatically use GPU when CUDA is available.
-    If GPU is not available, fall back to CPU.
-
-    The selected device is printed once because this function
-    is cached with @lru_cache(maxsize=1).
+    Build the predictor once: GPU when CUDA is available, CPU otherwise.
+    All .pth models are loaded here, not per frame.
     """
-
     runtime = get_antispoof_runtime_info()
+    on_gpu = runtime["device"] == "GPU"
 
-    if runtime["device"] == "GPU":
-        print("=" * 60)
-        print("[Anti-Spoof] GPU FOUND")
-        print(f"[Anti-Spoof] GPU name: {runtime['gpu_name']}")
-        print(f"[Anti-Spoof] Device: cuda:{runtime['device_id']}")
-        print(f"[Anti-Spoof] PyTorch: {runtime['torch_version']}")
-        print(f"[Anti-Spoof] CUDA: {runtime['cuda_version']}")
-        print("=" * 60)
-
-        device_id = runtime["device_id"]
-
-    else:
-        print("=" * 60)
-        print("[Anti-Spoof] GPU NOT FOUND")
-        print("[Anti-Spoof] Falling back to CPU")
-        print(f"[Anti-Spoof] PyTorch: {runtime['torch_version']}")
-
-        if runtime.get("error"):
-            print(f"[Anti-Spoof] Error: {runtime['error']}")
-
-        print("=" * 60)
-
-        device_id = 0
-
-    # AntiSpoofPredict should internally use:
-    #
-    #   cuda:<device_id>
-    #
-    # when torch.cuda.is_available() is True,
-    # otherwise it will use CPU.
     predictor = AntiSpoofPredict(
-        device_id=device_id,
+        device_id=runtime["device_id"] or 0,
+        force_cpu=not on_gpu,
+        model_dir=MODEL_DIR,
+        use_fp16=USE_FP16,
     )
 
-    # Print the actual device selected by AntiSpoofPredict,
-    # if the class exposes a .device attribute.
-    actual_device = getattr(
-        predictor,
-        "device",
-        None,
+    print(
+        f"[Anti-Spoof] device={predictor.device} "
+        f"fp16={predictor.use_fp16} "
+        f"gpu={runtime.get('gpu_name')} "
+        f"models={[m.name for m in predictor.models]}"
     )
 
-    if actual_device is not None:
-        print(
-            f"[Anti-Spoof] Actual inference device: {actual_device}"
-        )
+    if runtime.get("error"):
+        print(f"[Anti-Spoof] runtime error: {runtime['error']}")
 
     return predictor
 
 
 @lru_cache(maxsize=1)
 def get_cropper() -> CropImage:
-    """
-    Create CropImage only once.
-    """
     return CropImage()
-
-
-# ---------------------------------------------------------------------------
-# Model files
-# ---------------------------------------------------------------------------
-
-def _iter_model_files(model_dir: str) -> list[str]:
-    """
-    Return all .pth anti-spoof model files sorted by filename.
-    """
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(
-            f"Anti-spoof model dir not found: {model_dir}"
-        )
-
-    files: list[str] = []
-
-    for name in os.listdir(model_dir):
-        path = os.path.join(model_dir, name)
-
-        if (
-            os.path.isfile(path)
-            and name.lower().endswith(".pth")
-        ):
-            files.append(path)
-
-    if not files:
-        raise FileNotFoundError(
-            f"No anti-spoof model files found in: {model_dir}"
-        )
-
-    return sorted(files)
 
 
 # ---------------------------------------------------------------------------
@@ -341,261 +267,122 @@ def _looks_like_screen_replay(
 
 
 # ---------------------------------------------------------------------------
-# Main anti-spoof inference
+# Anti-spoof pipeline, split so the GPU part can be batched across sessions
+#
+#   prepare_antispoof()      CPU, per frame, any worker thread
+#   infer_antispoof_batch()  GPU, one call for many frames, single GPU thread
+#   finalize_antispoof()     trivial, per frame
 # ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class AntiSpoofInput:
+    # One crop per loaded model, each (H, W, 3) uint8 BGR.
+    crops: List[np.ndarray]
+    is_screen: bool
+    screen_reason: str
+
+
+def prepare_antispoof(
+    image_bgr: np.ndarray,
+) -> Tuple[Optional[AntiSpoofInput], Optional[Result]]:
+    """
+    CPU work: resize, face bbox, screen heuristic, per-model crops.
+
+    Returns (input, None) when the frame should go to the model,
+    or (None, result) when the answer is already known (no face, ...).
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return None, (False, 0.0, "empty_image")
+
+    image_bgr = _safe_resize_if_needed(image_bgr)
+
+    predictor = get_antispoof_model()
+
+    try:
+        bbox = predictor.get_bbox(image_bgr)
+    except Exception as exc:
+        return None, (False, 0.0, f"bbox_error:{exc}")
+
+    if not bbox:
+        return None, (False, 0.0, "no_face_bbox")
+
+    is_screen, screen_reason = _looks_like_screen_replay(image_bgr)
+
+    cropper = get_cropper()
+    crops: List[np.ndarray] = []
+
+    for loaded in predictor.models:
+        crops.append(
+            cropper.crop(
+                org_img=image_bgr,
+                bbox=bbox,
+                scale=1.0 if loaded.scale is None else loaded.scale,
+                out_w=loaded.w_input,
+                out_h=loaded.h_input,
+                crop=loaded.scale is not None,
+            )
+        )
+
+    return AntiSpoofInput(crops, is_screen, screen_reason), None
+
+
+def infer_antispoof_batch(
+    inputs: Sequence[AntiSpoofInput],
+) -> List[np.ndarray]:
+    """GPU work: one forward pass per model for the whole batch."""
+    if not inputs:
+        return []
+
+    predictor = get_antispoof_model()
+
+    stacked = [
+        np.stack([item.crops[i] for item in inputs])
+        for i in range(len(predictor.models))
+    ]
+
+    summed = predictor.predict_batch(stacked)
+
+    return [summed[i] for i in range(len(inputs))]
+
+
+def finalize_antispoof(
+    item: AntiSpoofInput,
+    prediction: np.ndarray,
+) -> Result:
+    total = float(np.sum(prediction))
+
+    if total <= 0.0:
+        return False, 0.0, "no_valid_model_prediction"
+
+    label = int(np.argmax(prediction))
+    real_score = float(prediction[REAL_LABEL] / total)
+    is_real = label == REAL_LABEL
+
+    if item.is_screen and (not is_real or real_score < 0.85):
+        return False, real_score, item.screen_reason
+
+    if is_real and item.is_screen:
+        return True, real_score, f"soft_screen_suspect:{item.screen_reason}"
+
+    return is_real, real_score, f"label={label},real_score={real_score:.4f}"
+
 
 def predict_antispoof_score(
     image_bgr: np.ndarray,
-) -> Tuple[bool, float, str]:
+) -> Result:
     """
-    Run all available MiniVision anti-spoof models on one image.
-
-    Returns:
-        (
-            is_real,
-            real_score,
-            reason,
-        )
-
-    Example:
-
-        (
-            True,
-            0.9821,
-            "label=1,real_score=0.9821"
-        )
-
-    For the original MiniVision pretrained weights:
-
-        label == 1  -> REAL
-        otherwise   -> SPOOF
+    Single-image convenience API (kept for liveness_service.py and scripts).
+    Returns (is_real, real_score, reason).
     """
-
-    if (
-        image_bgr is None
-        or image_bgr.size == 0
-    ):
-        return (
-            False,
-            0.0,
-            "empty_image",
-        )
-
     try:
-        # ---------------------------------------------------------------
-        # Resize input if necessary
-        # ---------------------------------------------------------------
+        item, early = prepare_antispoof(image_bgr)
 
-        image_bgr = _safe_resize_if_needed(
-            image_bgr
-        )
+        if early is not None:
+            return early
 
-        # ---------------------------------------------------------------
-        # Additional replay-screen heuristic
-        # ---------------------------------------------------------------
+        prediction = infer_antispoof_batch([item])[0]
 
-        is_screen, screen_reason = (
-            _looks_like_screen_replay(
-                image_bgr
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Get cached detector / cropper
-        # ---------------------------------------------------------------
-
-        model_test = get_antispoof_model()
-        image_cropper = get_cropper()
-
-        # MiniVision outputs three classes.
-        prediction = np.zeros(
-            (1, 3),
-            dtype=np.float32,
-        )
-
-        # ---------------------------------------------------------------
-        # Detect face bounding box
-        # ---------------------------------------------------------------
-
-        try:
-            image_bbox = model_test.get_bbox(
-                image_bgr
-            )
-
-            if not image_bbox:
-                return (
-                    False,
-                    0.0,
-                    "no_face_bbox",
-                )
-
-        except Exception as exc:
-            return (
-                False,
-                0.0,
-                f"bbox_error:{exc}",
-            )
-
-        # ---------------------------------------------------------------
-        # Run all .pth models
-        # ---------------------------------------------------------------
-
-        valid_models = 0
-
-        for model_path in _iter_model_files(
-            MODEL_DIR
-        ):
-            model_name = os.path.basename(
-                model_path
-            )
-
-            try:
-                (
-                    h_input,
-                    w_input,
-                    model_type,
-                    scale,
-                ) = parse_model_name(
-                    model_name
-                )
-
-            except Exception:
-                continue
-
-            params = {
-                "org_img": image_bgr,
-                "bbox": image_bbox,
-                "scale": (
-                    1.0
-                    if scale is None
-                    else scale
-                ),
-                "out_w": w_input,
-                "out_h": h_input,
-                "crop": True,
-            }
-
-            if scale is None:
-                params["crop"] = False
-
-            try:
-                cropped = image_cropper.crop(
-                    **params
-                )
-
-                pred = model_test.predict(
-                    cropped,
-                    model_path,
-                )
-
-                prediction += pred
-                valid_models += 1
-
-            except Exception:
-                continue
-
-        # ---------------------------------------------------------------
-        # Validate prediction
-        # ---------------------------------------------------------------
-
-        prediction_sum = float(
-            prediction.sum()
-        )
-
-        if (
-            valid_models == 0
-            or prediction_sum <= 0.0
-        ):
-            return (
-                False,
-                0.0,
-                "no_valid_model_prediction",
-            )
-
-        # ---------------------------------------------------------------
-        # Determine predicted class
-        # ---------------------------------------------------------------
-
-        label = int(
-            np.argmax(prediction)
-        )
-
-        total = float(
-            np.sum(prediction)
-        )
-
-        # IMPORTANT:
-        # REAL_LABEL = 1 for the original MiniVision weights.
-        real_score = (
-            float(
-                prediction[0][REAL_LABEL]
-                / total
-            )
-            if total > 0
-            else 0.0
-        )
-
-        is_real = (
-            label == REAL_LABEL
-        )
-
-        # ---------------------------------------------------------------
-        # Combine model result with screen heuristic
-        # ---------------------------------------------------------------
-
-        if (
-            is_screen
-            and (
-                not is_real
-                or real_score < 0.85
-            )
-        ):
-            return (
-                False,
-                real_score,
-                screen_reason,
-            )
-
-        # ---------------------------------------------------------------
-        # REAL
-        # ---------------------------------------------------------------
-
-        if is_real:
-            if is_screen:
-                return (
-                    True,
-                    real_score,
-                    (
-                        "soft_screen_suspect:"
-                        f"{screen_reason}"
-                    ),
-                )
-
-            return (
-                True,
-                real_score,
-                (
-                    f"label={label},"
-                    f"real_score={real_score:.4f}"
-                ),
-            )
-
-        # ---------------------------------------------------------------
-        # SPOOF
-        # ---------------------------------------------------------------
-
-        return (
-            False,
-            real_score,
-            (
-                f"label={label},"
-                f"real_score={real_score:.4f}"
-            ),
-        )
+        return finalize_antispoof(item, prediction)
 
     except Exception as exc:
-        return (
-            False,
-            0.0,
-            f"antispoof_exception:{exc}",
-        )
+        return False, 0.0, f"antispoof_exception:{exc}"

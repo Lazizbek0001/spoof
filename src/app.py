@@ -3,62 +3,60 @@ from __future__ import annotations
 import os
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
-os.environ.setdefault(
-    "TF_CPP_MIN_LOG_LEVEL",
-    "2",
-)
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# TensorFlow shares the GPU with PyTorch: never let it grab all VRAM.
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from random import SystemRandom
 
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    WebSocketDisconnect,
-)
+import cv2
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from src.face_actions import FaceActionAnalyzer
-from face_util.gpu_utils import (
-    describe_runtime,
-    get_runtime_info,
-)
+from face_util.anti_spoof_infer import infer_antispoof_batch
+from face_util.gpu_utils import describe_runtime, get_runtime_info
 
+from src.batching import MicroBatcher
 from src.config import settings
+from src.face_actions import FaceActionAnalyzer
 from src.helpers import (
     check_api_key,
-    decode_b64_image,
-    decode_bgr,
+    decode_frame,
     get_remaining_time,
     process_liveness_frame,
+    receive_message,
+    run_in_pool,
     send_ack,
     send_final,
-    send_timeout,
     warmup_antispoof,
-    warmup_deepface,
+    warmup_cpu_thread,
 )
 from src.liveness import LivenessSession
+from src.recognition import FaceRecognizer
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-FACE_LANDMARKER_MODEL = Path(
-    "src/models/face_landmarker.task"
-)
+# Paths are resolved against the project, not the current working directory.
+_SRC_DIR = Path(__file__).resolve().parent
 
-REFERENCE_IMAGE = Path(
-    "sample/5.jpg"
-)
+FACE_LANDMARKER_MODEL = _SRC_DIR / "models" / "face_landmarker.task"
 
-FACE_MATCHES_REQUIRED = 3
+REFERENCE_IMAGE = Path(settings.reference_image)
 
-ACTION_MATCHES_REQUIRED = 2
+if not REFERENCE_IMAGE.is_absolute():
+    REFERENCE_IMAGE = _SRC_DIR.parent / REFERENCE_IMAGE
+
+FACE_MATCHES_REQUIRED = settings.face_matches_required
+
+ACTION_MATCHES_REQUIRED = settings.action_matches_required
 
 FACE_ACTIONS = (
     "turn_left",
@@ -72,7 +70,7 @@ _random = SystemRandom()
 
 
 # ============================================================
-# VERIFICATION STAGES
+# VERIFICATION STATE
 # ============================================================
 
 class VerificationStage:
@@ -82,119 +80,47 @@ class VerificationStage:
     DONE = "done"
 
 
-# ============================================================
-# VERIFICATION SESSION
-# ============================================================
-
 class VerificationSession:
-    def __init__(
-        self,
-        reference_image: str | Path,
-    ):
+    def __init__(self, reference_image: str | Path):
         self.stage = VerificationStage.ANTISPOOF
+        self.reference_image = str(reference_image)
 
-        self.reference_image = str(
-            reference_image
-        )
-
-        # -----------------------------------------------
         # Anti-spoof
-        # -----------------------------------------------
-
         self.liveness_decision: dict | None = None
 
-        # -----------------------------------------------
         # Face recognition
-        # -----------------------------------------------
-
         self.identity_verified = False
-
         self.face_match_count = 0
 
-        # -----------------------------------------------
-        # Actions
-        # -----------------------------------------------
-
-        # Random order makes replaying a predefined
-        # sequence harder.
-        self.actions = _random.sample(
-            list(FACE_ACTIONS),
-            len(FACE_ACTIONS),
-        )
-
+        # Actions: random order makes replaying a predefined sequence harder.
+        self.actions = _random.sample(list(FACE_ACTIONS), len(FACE_ACTIONS))
         self.action_index = 0
-
         self.action_match_count = 0
-
         self.completed_actions: list[str] = []
 
     @property
-    def current_action(
-        self,
-    ) -> str | None:
-
-        if self.action_index >= len(
-            self.actions
-        ):
+    def current_action(self) -> str | None:
+        if self.action_index >= len(self.actions):
             return None
+        return self.actions[self.action_index]
 
-        return self.actions[
-            self.action_index
-        ]
-
-    def complete_current_action(
-        self,
-    ) -> str | None:
-
+    def complete_current_action(self) -> str | None:
         action = self.current_action
-
         if action is None:
             return None
 
-        self.completed_actions.append(
-            action
-        )
-
+        self.completed_actions.append(action)
         self.action_index += 1
         self.action_match_count = 0
-
         return action
 
-    @property
-    def all_actions_completed(
-        self,
-    ) -> bool:
-
-        return (
-            self.action_index
-            >= len(self.actions)
-        )
-
-
-# ============================================================
-# LIVENESS SESSION
-# ============================================================
 
 def create_liveness_session() -> LivenessSession:
     return LivenessSession(
         window_size=settings.window_size,
-        min_real_frames=(
-            settings.min_real_frames
-        ),
-        min_avg_score=(
-            settings.min_avg_score
-        ),
-        required_real_ratio=(
-            settings.required_real_ratio
-        ),
-    )
-
-
-def create_verification_session(
-) -> VerificationSession:
-
-    return VerificationSession(
-        reference_image=REFERENCE_IMAGE,
+        min_real_frames=settings.min_real_frames,
+        min_avg_score=settings.min_avg_score,
+        required_real_ratio=settings.required_real_ratio,
     )
 
 
@@ -202,95 +128,111 @@ def create_verification_session(
 # LIFESPAN
 # ============================================================
 
-@asynccontextmanager
-async def lifespan(
-    app: FastAPI,
-):
-    executor = ThreadPoolExecutor(
-        max_workers=settings.max_workers,
-        thread_name_prefix="verification",
-    )
+async def _warm_cpu_threads(
+    pool: ThreadPoolExecutor,
+    count: int,
+    analyzer: FaceActionAnalyzer,
+) -> None:
+    """
+    Force the pool to spawn all its threads and initialise the per-thread
+    face detector + landmarker in each, so no session pays that cost.
+    The barrier keeps every task busy until all threads have started.
+    """
+    barrier = threading.Barrier(count)
 
-    inference_semaphore = asyncio.Semaphore(
-        settings.max_workers
-    )
-
-    # MediaPipe FaceLandmarker instance shouldn't
-    # be called concurrently from many threads.
-    face_action_lock = asyncio.Lock()
-
-    app.state.executor = executor
-    app.state.inference_semaphore = (
-        inference_semaphore
-    )
-
-    app.state.face_action_lock = (
-        face_action_lock
-    )
-
-    print(
-        "[startup]\n"
-        + describe_runtime()
-    )
-
-    # --------------------------------------------------------
-    # Warmup models
-    # --------------------------------------------------------
+    def task() -> None:
+        warmup_cpu_thread(analyzer)
+        try:
+            barrier.wait(timeout=30)
+        except threading.BrokenBarrierError:
+            pass
 
     loop = asyncio.get_running_loop()
 
-    await loop.run_in_executor(
-        executor,
-        warmup_antispoof,
+    await asyncio.gather(
+        *(loop.run_in_executor(pool, task) for _ in range(count))
     )
 
-    await loop.run_in_executor(
-        executor,
-        warmup_deepface,
-    )
 
-    # --------------------------------------------------------
-    # Face action model
-    # --------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Parallelism comes from the pools; OpenCV's own threads would only
+    # oversubscribe the cores.
+    cv2.setNumThreads(1)
+
+    # CPU pool : decode, face bbox, screen heuristic, crops, MediaPipe
+    # GPU pool : exactly one thread, fed with batches by the micro-batcher
+    # Recog    : DeepFace / TensorFlow
+    cpu_pool = ThreadPoolExecutor(settings.cpu_workers, thread_name_prefix="cpu")
+    gpu_pool = ThreadPoolExecutor(1, thread_name_prefix="gpu")
+    recog_pool = ThreadPoolExecutor(settings.recog_workers, thread_name_prefix="recog")
+
+    batcher = MicroBatcher(
+        infer_antispoof_batch,
+        gpu_pool,
+        max_batch=settings.max_batch,
+        max_wait=settings.max_batch_wait_ms / 1000.0,
+    )
 
     if not FACE_LANDMARKER_MODEL.is_file():
         raise RuntimeError(
-            "Face Landmarker model not found: "
-            f"{FACE_LANDMARKER_MODEL}"
+            f"Face Landmarker model not found: {FACE_LANDMARKER_MODEL}"
         )
 
-    app.state.face_analyzer = (
-        FaceActionAnalyzer(
-            model_path=(
-                FACE_LANDMARKER_MODEL
-            ),
-        )
+    face_analyzer = FaceActionAnalyzer(model_path=FACE_LANDMARKER_MODEL)
+    recognizer = FaceRecognizer()
+
+    app.state.cpu_pool = cpu_pool
+    app.state.recog_pool = recog_pool
+    app.state.batcher = batcher
+    app.state.face_analyzer = face_analyzer
+    app.state.recognizer = recognizer
+    app.state.active_sessions = 0
+
+    print("[startup]\n" + describe_runtime())
+
+    loop = asyncio.get_running_loop()
+
+    await loop.run_in_executor(gpu_pool, warmup_antispoof)
+    await _warm_cpu_threads(cpu_pool, settings.cpu_workers, face_analyzer)
+    await loop.run_in_executor(recog_pool, recognizer.warmup)
+
+    if REFERENCE_IMAGE.is_file():
+        try:
+            await loop.run_in_executor(
+                recog_pool,
+                recognizer.reference_embedding,
+                REFERENCE_IMAGE,
+            )
+        except Exception as exc:
+            print(f"[startup] reference embedding failed: {exc}")
+
+    batcher.start()
+
+    print(
+        "[startup] warmup done "
+        f"(cpu_workers={settings.cpu_workers}, "
+        f"recog_workers={settings.recog_workers}, "
+        f"max_batch={settings.max_batch}, "
+        f"max_sessions={settings.max_sessions})"
     )
-
-    print("[startup] warmup done")
 
     try:
         yield
 
     finally:
-        print(
-            "[shutdown] closing models"
-        )
+        print("[shutdown] closing models")
+
+        await batcher.stop()
 
         try:
-            app.state.face_analyzer.close()
+            face_analyzer.close()
         except Exception:
             pass
 
-        executor.shutdown(
-            wait=False,
-            cancel_futures=True,
-        )
+        for pool in (cpu_pool, gpu_pool, recog_pool):
+            pool.shutdown(wait=False, cancel_futures=True)
 
-
-# ============================================================
-# FASTAPI
-# ============================================================
 
 app = FastAPI(
     title="Liveness API",
@@ -299,1150 +241,558 @@ app = FastAPI(
 
 
 # ============================================================
-# BLOCKING MODEL RUNNER
+# ONE WEBSOCKET CONNECTION
 # ============================================================
 
-async def run_blocking_model(
-    func,
-    *args,
-    timeout: float,
-):
-    loop = asyncio.get_running_loop()
+class StreamHandler:
+    def __init__(self, websocket: WebSocket):
+        self.ws = websocket
+        self.state = websocket.app.state
 
-    async with app.state.inference_semaphore:
+        self.loop = asyncio.get_running_loop()
+        self.started_at = self.loop.time()
+        self.deadline = self.started_at + settings.max_connection_seconds
 
-        future = loop.run_in_executor(
-            app.state.executor,
-            partial(
-                func,
-                *args,
-            ),
-        )
+        self.session_id: str | None = None
+        self.challenge_results: dict[str, dict] = {}
+        self._reset_session()
 
-        return await asyncio.wait_for(
-            future,
-            timeout=timeout,
-        )
+    # --------------------------------------------------------
+    # State
+    # --------------------------------------------------------
 
+    def _reset_session(self) -> None:
+        self.verification = VerificationSession(REFERENCE_IMAGE)
+        self.liveness: LivenessSession | None = None
+        self.frame_counter = 0
+        self.challenge_results.clear()
 
-# ============================================================
-# FACE RECOGNITION
-# ============================================================
+    @property
+    def remaining(self) -> float:
+        return get_remaining_time(self.loop, self.deadline)
 
-async def process_face_recognition(
-    verification_session: VerificationSession,
-    frame,
-    timeout: float,
-) -> dict:
+    @property
+    def elapsed(self) -> float:
+        return self.loop.time() - self.started_at
 
-    verification = await run_blocking_model(
-        app.state.face_analyzer.verify_face,
-        verification_session.reference_image,
-        frame,
-        timeout=timeout,
-    )
+    def current_challenge(self) -> str:
+        stage = self.verification.stage
 
-    if verification["verified"]:
+        if stage == VerificationStage.ACTION:
+            return self.verification.current_action or "action"
 
-        verification_session.face_match_count += 1
+        if stage in (
+            VerificationStage.ANTISPOOF,
+            VerificationStage.FACE_RECOGNITION,
+        ):
+            return stage
 
-    else:
+        return "unknown"
 
-        # Require consecutive matches.
-        verification_session.face_match_count = 0
-
-    if (
-        verification_session.face_match_count
-        >= FACE_MATCHES_REQUIRED
-    ):
-        verification_session.identity_verified = True
-
-        verification_session.stage = (
-            VerificationStage.ACTION
-        )
-
-    return verification
-
-
-# ============================================================
-# FACIAL ACTION
-# ============================================================
-
-async def process_face_action(
-    verification_session: VerificationSession,
-    frame,
-    timeout: float,
-) -> dict:
-
-    action = (
-        verification_session.current_action
-    )
-
-    if action is None:
-        return {
-            "ok": True,
-            "action": None,
-            "reason": "all_actions_completed",
-        }
-
-    # Serialize calls to the MediaPipe landmarker.
-    async with app.state.face_action_lock:
-
-        result = await run_blocking_model(
-            app.state.face_analyzer.check_action,
-            frame,
-            action,
-            timeout=timeout,
-        )
-
-    if result["ok"]:
-
-        verification_session.action_match_count += 1
-
-    else:
-
-        # Require consecutive detections
-        verification_session.action_match_count = 0
-
-    return result
-
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
-async def send_challenge_result(
-    websocket: WebSocket,
-    *,
-    challenge: str,
-    passed: bool,
-    reason: str,
-    details: dict | None = None,
-) -> None:
-    await websocket.send_json(
-        {
-            "type": "challenge_result",
-            "challenge": challenge,
-            "passed": passed,
-            "status": (
-                "passed"
-                if passed
-                else "failed"
-            ),
-            "reason": reason,
-            "details": details or {},
-        }
-    )
-@app.websocket("/ws/stream")
-async def ws_stream(
-    websocket: WebSocket,
-):
-    # ========================================================
-    # API KEY
-    # ========================================================
-
-    if not await check_api_key(
-        websocket,
-        settings.api_key,
-    ):
-        return
-
-    await websocket.accept()
-
-    # ========================================================
-    # REFERENCE IMAGE
-    # ========================================================
-
-    if not REFERENCE_IMAGE.is_file():
-        await websocket.send_json(
-            {
-                "type": "error",
-                "message": (
-                    "reference_image_not_found:"
-                    f"{REFERENCE_IMAGE}"
-                ),
-            }
-        )
-
-        await websocket.close()
-        return
-
-    # ========================================================
-    # SESSION STATE
-    # ========================================================
-
-    verification_session = (
-        create_verification_session()
-    )
-
-    liveness_session: (
-        LivenessSession | None
-    ) = None
-
-    session_id: str | None = None
-
-    frame_counter = 0
-
-    challenge_results: dict[
-        str,
-        dict,
-    ] = {}
-
-    # ========================================================
-    # TIMER
-    # ========================================================
-
-    loop = asyncio.get_running_loop()
-
-    started_at = loop.time()
-
-    deadline = (
-        started_at
-        + settings.max_connection_seconds
-    )
-
-    # ========================================================
-    # STORE CHALLENGE RESULT
-    # ========================================================
-
-    def save_challenge_result(
-        *,
+    def save_result(
+        self,
         challenge: str,
         passed: bool,
         reason: str,
         details: dict | None = None,
     ) -> None:
-        challenge_results[
-            challenge
-        ] = {
+        self.challenge_results[challenge] = {
             "challenge": challenge,
             "passed": passed,
-            "status": (
-                "passed"
-                if passed
-                else "failed"
-            ),
+            "status": "passed" if passed else "failed",
             "reason": reason,
-            "details": (
-                details or {}
-            ),
+            "details": details or {},
         }
 
-    # ========================================================
-    # CURRENT CHALLENGE
-    # ========================================================
+    # --------------------------------------------------------
+    # Final messages
+    # --------------------------------------------------------
 
-    def get_current_challenge() -> str:
-        if (
-            verification_session.stage
-            == VerificationStage.ANTISPOOF
-        ):
-            return "antispoof"
-
-        if (
-            verification_session.stage
-            == VerificationStage.FACE_RECOGNITION
-        ):
-            return "face_recognition"
-
-        if (
-            verification_session.stage
-            == VerificationStage.ACTION
-        ):
-            return (
-                verification_session.current_action
-                or "action"
-            )
-
-        return "unknown"
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
-
-    async def finish_verification(
-        *,
-        ok: bool,
-        reason: str,
-    ) -> None:
-        elapsed = (
-            loop.time()
-            - started_at
-        )
-
-        final_decision = {
-            "liveness": (
-                verification_session
-                .liveness_decision
-                is not None
-            ),
-            "face_verified": (
-                verification_session
-                .identity_verified
-            ),
-            "completed_actions": (
-                verification_session
-                .completed_actions
-            ),
-            "challenge_results": (
-                challenge_results
-            ),
-        }
-
+    async def finish(self, *, ok: bool, reason: str) -> None:
         await send_final(
-            websocket,
+            self.ws,
             ok=ok,
             reason=reason,
-            decision=final_decision,
-            elapsed=elapsed,
+            decision={
+                "liveness": self.verification.liveness_decision is not None,
+                "face_verified": self.verification.identity_verified,
+                "completed_actions": self.verification.completed_actions,
+                "challenge_results": self.challenge_results,
+            },
+            elapsed=self.elapsed,
         )
 
-    # ========================================================
-    # TIMEOUT
-    # ========================================================
+    async def fail(
+        self,
+        challenge: str,
+        reason: str,
+        details: dict | None = None,
+    ) -> None:
+        self.save_result(challenge, False, reason, details)
+        await self.finish(ok=False, reason=reason)
 
-    async def handle_timeout() -> None:
-        challenge = (
-            get_current_challenge()
-        )
-
-        existing = (
-            challenge_results.get(
-                challenge
-            )
-        )
+    async def handle_timeout(self) -> None:
+        challenge = self.current_challenge()
+        existing = self.challenge_results.get(challenge)
 
         # Do not replace an already-passed challenge.
-        if not (
-            existing
-            and existing.get(
-                "passed",
+        if not (existing and existing.get("passed", False)):
+            self.save_result(
+                challenge,
                 False,
+                "timeout",
+                {"max_seconds": settings.max_connection_seconds},
             )
-        ):
-            save_challenge_result(
-                challenge=challenge,
-                passed=False,
-                reason="timeout",
-                details={
-                    "max_seconds": (
-                        settings
-                        .max_connection_seconds
-                    ),
+
+        await self.finish(ok=False, reason="connection_timeout")
+
+    # --------------------------------------------------------
+    # Model calls
+    # --------------------------------------------------------
+
+    async def _liveness(self, frame) -> dict:
+        return await process_liveness_frame(
+            image=frame,
+            cpu_executor=self.state.cpu_pool,
+            batcher=self.state.batcher,
+            timeout=self.remaining,
+        )
+
+    async def _verify(self, frame) -> dict:
+        return await run_in_pool(
+            self.state.recog_pool,
+            self.state.recognizer.verify,
+            self.verification.reference_image,
+            frame,
+            timeout=self.remaining,
+        )
+
+    # --------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------
+
+    async def run(self) -> None:
+        try:
+            while True:
+                if self.remaining <= 0:
+                    await self.handle_timeout()
+                    return
+
+                message = await receive_message(self.ws, self.remaining)
+                message_type = message.get("type")
+
+                if message_type == "close":
+                    return
+
+                if message_type == "reset":
+                    self.session_id = None
+                    self._reset_session()
+
+                    await self.ws.send_json(
+                        {
+                            "type": "reset_ok",
+                            "stage": VerificationStage.ANTISPOOF,
+                            "remaining_seconds": round(self.remaining, 2),
+                        }
+                    )
+                    continue
+
+                if message_type != "frame":
+                    await self.ws.send_json(
+                        {
+                            "type": "error",
+                            "message": f"unknown_type:{message_type}",
+                        }
+                    )
+                    continue
+
+                # Binary frames carry no session id: keep the current one.
+                incoming = str(
+                    message.get("session_id")
+                    or (
+                        self.session_id
+                        if isinstance(message.get("frame"), bytes)
+                        else None
+                    )
+                    or "default"
+                )
+
+                if self.liveness is None or incoming != self.session_id:
+                    self.session_id = incoming
+                    self._reset_session()
+                    self.liveness = create_liveness_session()
+
+                # JPEG / base64 decoding happens in the CPU pool.
+                frame, error = await run_in_pool(
+                    self.state.cpu_pool,
+                    decode_frame,
+                    message.get("frame", ""),
+                    timeout=max(self.remaining, 0.001),
+                )
+
+                if error:
+                    await self.ws.send_json({"type": "error", "message": error})
+                    continue
+
+                self.frame_counter += 1
+
+                if self.remaining <= 0:
+                    await self.handle_timeout()
+                    return
+
+                stage = self.verification.stage
+
+                if stage == VerificationStage.ANTISPOOF:
+                    done = await self.stage_antispoof(frame)
+                elif stage == VerificationStage.FACE_RECOGNITION:
+                    done = await self.stage_recognition(frame)
+                elif stage == VerificationStage.ACTION:
+                    done = await self.stage_action(frame)
+                else:
+                    done = True
+
+                if done:
+                    return
+
+        except asyncio.TimeoutError:
+            await self.handle_timeout()
+
+    # --------------------------------------------------------
+    # STAGE 1 — ANTI-SPOOF
+    # --------------------------------------------------------
+
+    async def stage_antispoof(self, frame) -> bool:
+        try:
+            result = await self._liveness(frame)
+
+        except asyncio.TimeoutError:
+            raise
+
+        except Exception as exc:
+            await self.fail("antispoof", "liveness_error", {"error": str(exc)})
+            return True
+
+        decision = self.liveness.add(
+            is_real=result["is_real"],
+            score=result["score"],
+            reason=result["reason"],
+            frame_index=self.frame_counter,
+        )
+
+        await send_ack(
+            self.ws,
+            frame_index=self.frame_counter,
+            result=result,
+            decision=decision,
+            elapsed=self.elapsed,
+            remaining=self.remaining,
+        )
+
+        if decision.get("reason") == "screen_replay_detected":
+            await self.fail(
+                "antispoof",
+                "screen_replay_detected",
+                {"decision": decision},
+            )
+            return True
+
+        if decision.get("ready") and decision.get("ok"):
+            self.verification.liveness_decision = decision
+
+            self.save_result(
+                "antispoof",
+                True,
+                "liveness_passed",
+                {
+                    key: decision.get(key)
+                    for key in (
+                        "real_count",
+                        "fake_count",
+                        "real_ratio",
+                        "avg_score",
+                    )
                 },
             )
 
-        await finish_verification(
-            ok=False,
-            reason="connection_timeout",
+            self.verification.stage = VerificationStage.FACE_RECOGNITION
+
+            await self.ws.send_json(
+                {
+                    "type": "liveness_passed",
+                    "ok": True,
+                    "next_stage": "face_recognition",
+                }
+            )
+
+        return False
+
+    # --------------------------------------------------------
+    # STAGE 2 — FACE RECOGNITION
+    # --------------------------------------------------------
+
+    async def _send_recognition_miss(self, reason: str) -> None:
+        self.verification.face_match_count = 0
+
+        await self.ws.send_json(
+            {
+                "type": "face_recognition",
+                "verified": False,
+                "identity_verified": False,
+                "reason": reason,
+                "match_count": 0,
+                "required_matches": FACE_MATCHES_REQUIRED,
+            }
         )
 
-    try:
-        while True:
+    async def stage_recognition(self, frame) -> bool:
+        session = self.verification
 
-            # =================================================
-            # CHECK TIMEOUT
-            # =================================================
-
-            remaining = (
-                get_remaining_time(
-                    loop,
-                    deadline,
+        try:
+            if settings.recheck_liveness_on_recognition:
+                # Same frame goes through anti-spoof and recognition in
+                # parallel (GPU batcher + TF), so this costs no extra latency.
+                live, verification = await asyncio.gather(
+                    self._liveness(frame),
+                    self._verify(frame),
+                    return_exceptions=True,
                 )
+
+                for outcome in (verification, live):
+                    if isinstance(outcome, asyncio.TimeoutError):
+                        raise outcome
+
+                if isinstance(verification, Exception):
+                    raise verification
+
+                if isinstance(live, Exception):
+                    raise live
+
+                if not live["is_real"]:
+                    await self._send_recognition_miss("spoof_suspected")
+                    return False
+
+            else:
+                verification = await self._verify(frame)
+
+        except asyncio.TimeoutError:
+            raise
+
+        except ValueError:
+            await self._send_recognition_miss("face_not_detected")
+            return False
+
+        except Exception as exc:
+            await self.fail(
+                "face_recognition",
+                "face_recognition_error",
+                {"error": str(exc)},
+            )
+            return True
+
+        # Require consecutive matches.
+        if verification["verified"]:
+            session.face_match_count += 1
+        else:
+            session.face_match_count = 0
+
+        if session.face_match_count >= FACE_MATCHES_REQUIRED:
+            session.identity_verified = True
+            session.stage = VerificationStage.ACTION
+
+        response = {
+            "type": "face_recognition",
+            "verified": verification.get("verified", False),
+            "identity_verified": session.identity_verified,
+            "match_count": session.face_match_count,
+            "required_matches": FACE_MATCHES_REQUIRED,
+            "distance": verification.get("distance"),
+            "threshold": verification.get("threshold"),
+        }
+
+        if session.identity_verified:
+            self.save_result(
+                "face_recognition",
+                True,
+                "face_matched",
+                {
+                    "match_count": session.face_match_count,
+                    "required_matches": FACE_MATCHES_REQUIRED,
+                    "distance": verification.get("distance"),
+                    "threshold": verification.get("threshold"),
+                },
             )
 
-            if remaining <= 0:
-                await handle_timeout()
-                break
+            response["next_stage"] = "action"
+            response["action"] = session.current_action
 
-            # =================================================
-            # RECEIVE MESSAGE
-            # =================================================
+        await self.ws.send_json(response)
 
+        return False
+
+    # --------------------------------------------------------
+    # STAGE 3 — ONE ACTION ONLY
+    # --------------------------------------------------------
+
+    async def stage_action(self, frame) -> bool:
+        session = self.verification
+        action = session.current_action
+
+        if action is None:
+            await self.fail("action", "no_action_available")
+            return True
+
+        try:
+            # Per-thread landmarkers: no global lock, sessions run in parallel.
+            result = await run_in_pool(
+                self.state.cpu_pool,
+                self.state.face_analyzer.check_action,
+                frame,
+                action,
+                timeout=self.remaining,
+            )
+
+        except asyncio.TimeoutError:
+            raise
+
+        except Exception as exc:
+            await self.fail(action, "face_action_error", {"error": str(exc)})
+            return True
+
+        # Require consecutive detections.
+        if result["ok"]:
+            session.action_match_count += 1
+        else:
+            session.action_match_count = 0
+
+        detected = bool(result.get("ok", False))
+        reason = result.get("reason")
+
+        passed = (
+            detected
+            and session.action_match_count >= ACTION_MATCHES_REQUIRED
+        )
+
+        # The person performing the action must still be the recognised one.
+        if passed and settings.verify_identity_on_action:
             try:
-                message = (
-                    await asyncio.wait_for(
-                        websocket.receive_json(),
-                        timeout=remaining,
-                    )
-                )
+                identity = await self._verify(frame)
+                same_person = bool(identity["verified"])
 
             except asyncio.TimeoutError:
-                await handle_timeout()
-                break
+                raise
 
-            message_type = (
-                message.get(
-                    "type"
-                )
-            )
+            except Exception:
+                same_person = False
 
-            # =================================================
-            # CLOSE
-            # =================================================
+            if not same_person:
+                passed = False
+                detected = False
+                reason = "identity_mismatch"
+                session.action_match_count = 0
 
-            if message_type == "close":
-                break
+        matched_count = session.action_match_count
 
-            # =================================================
-            # RESET
-            # =================================================
+        response = {
+            "type": "action_result",
+            "action": action,
+            "detected": detected,
+            "reason": reason,
+            "match_count": matched_count,
+            "required_matches": ACTION_MATCHES_REQUIRED,
+            "action_completed": passed,
+            "completed_action": None,
+            "completed_actions": session.completed_actions,
+            "next_action": action,
+            "analysis": result.get("analysis"),
+        }
 
-            if message_type == "reset":
-                liveness_session = None
-                session_id = None
-                frame_counter = 0
+        if not passed:
+            await self.ws.send_json(response)
+            return False
 
-                challenge_results.clear()
+        completed = session.complete_current_action() or action
 
-                verification_session = (
-                    create_verification_session()
-                )
+        self.save_result(
+            completed,
+            True,
+            "action_detected",
+            {
+                "matches": matched_count,
+                "required_matches": ACTION_MATCHES_REQUIRED,
+                "analysis": result.get("analysis"),
+            },
+        )
 
-                await websocket.send_json(
-                    {
-                        "type": "reset_ok",
-                        "stage": (
-                            VerificationStage
-                            .ANTISPOOF
-                        ),
-                        "remaining_seconds": round(
-                            get_remaining_time(
-                                loop,
-                                deadline,
-                            ),
-                            2,
-                        ),
-                    }
-                )
+        response["completed_action"] = completed
+        response["completed_actions"] = session.completed_actions
+        response["next_action"] = None
 
-                continue
+        await self.ws.send_json(response)
 
-            # =================================================
-            # INVALID MESSAGE
-            # =================================================
+        # One action = done immediately.
+        session.stage = VerificationStage.DONE
 
-            if message_type != "frame":
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": (
-                            "unknown_type:"
-                            f"{message_type}"
-                        ),
-                    }
-                )
+        await self.finish(ok=True, reason="verification_complete")
 
-                continue
+        return True
 
-            # =================================================
-            # SESSION ID
-            # =================================================
 
-            incoming_session_id = str(
-                message.get(
-                    "session_id"
-                )
-                or "default"
-            )
 
-            if (
-                liveness_session is None
-                or incoming_session_id
-                != session_id
-            ):
-                session_id = (
-                    incoming_session_id
-                )
+@app.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket):
+    if not await check_api_key(websocket, settings.api_key):
+        return
 
-                liveness_session = (
-                    create_liveness_session()
-                )
+    state = websocket.app.state
 
-                verification_session = (
-                    create_verification_session()
-                )
+    # Admission control: refuse instead of degrading every active session.
+    if state.active_sessions >= settings.max_sessions:
+        await websocket.close(code=1013, reason="Server busy")
+        return
 
-                challenge_results.clear()
+    await websocket.accept()
 
-                frame_counter = 0
+    state.active_sessions += 1
 
-            # =================================================
-            # DECODE BASE64
-            # =================================================
+    handler: StreamHandler | None = None
 
-            image_bytes = (
-                decode_b64_image(
-                    message.get(
-                        "frame",
-                        "",
-                    )
-                )
-            )
-
-            if not image_bytes:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": (
-                            "bad_frame_encoding"
-                        ),
-                    }
-                )
-
-                continue
-
-            frame_counter += 1
-
-            remaining = (
-                get_remaining_time(
-                    loop,
-                    deadline,
-                )
-            )
-
-            if remaining <= 0:
-                await handle_timeout()
-                break
-
-            # =================================================
-            # STAGE 1 — ANTI-SPOOF
-            # =================================================
-
-            if (
-                verification_session.stage
-                == VerificationStage.ANTISPOOF
-            ):
-                try:
-                    result = (
-                        await process_liveness_frame(
-                            image_bytes=image_bytes,
-                            executor=(
-                                app.state.executor
-                            ),
-                            semaphore=(
-                                app.state
-                                .inference_semaphore
-                            ),
-                            timeout=remaining,
-                        )
-                    )
-
-                except asyncio.TimeoutError:
-                    await handle_timeout()
-                    break
-
-                except Exception as exc:
-                    save_challenge_result(
-                        challenge="antispoof",
-                        passed=False,
-                        reason="liveness_error",
-                        details={
-                            "error": str(exc),
-                        },
-                    )
-
-                    await finish_verification(
-                        ok=False,
-                        reason="liveness_error",
-                    )
-
-                    break
-
-                decision = (
-                    liveness_session.add(
-                        is_real=result[
-                            "is_real"
-                        ],
-                        score=result[
-                            "score"
-                        ],
-                        reason=result[
-                            "reason"
-                        ],
-                        frame_index=(
-                            frame_counter
-                        ),
-                    )
-                )
-
-                elapsed = (
-                    loop.time()
-                    - started_at
-                )
-
-                remaining = (
-                    get_remaining_time(
-                        loop,
-                        deadline,
-                    )
-                )
-
-                # ---------------------------------------------
-                # PROGRESS
-                # ---------------------------------------------
-
-                await send_ack(
-                    websocket,
-                    frame_index=frame_counter,
-                    result=result,
-                    decision=decision,
-                    elapsed=elapsed,
-                    remaining=remaining,
-                )
-
-                # ---------------------------------------------
-                # SCREEN REPLAY FAIL
-                # ---------------------------------------------
-
-                if (
-                    decision.get(
-                        "reason"
-                    )
-                    == "screen_replay_detected"
-                ):
-                    save_challenge_result(
-                        challenge="antispoof",
-                        passed=False,
-                        reason=(
-                            "screen_replay_detected"
-                        ),
-                        details={
-                            "decision": (
-                                decision
-                            ),
-                        },
-                    )
-
-                    await finish_verification(
-                        ok=False,
-                        reason=(
-                            "screen_replay_detected"
-                        ),
-                    )
-
-                    break
-
-                # ---------------------------------------------
-                # ANTI-SPOOF PASSED
-                # ---------------------------------------------
-
-                if (
-                    decision.get(
-                        "ready"
-                    )
-                    and
-                    decision.get(
-                        "ok"
-                    )
-                ):
-                    verification_session.liveness_decision = (
-                        decision
-                    )
-
-                    save_challenge_result(
-                        challenge="antispoof",
-                        passed=True,
-                        reason="liveness_passed",
-                        details={
-                            "real_count": (
-                                decision.get(
-                                    "real_count"
-                                )
-                            ),
-                            "fake_count": (
-                                decision.get(
-                                    "fake_count"
-                                )
-                            ),
-                            "real_ratio": (
-                                decision.get(
-                                    "real_ratio"
-                                )
-                            ),
-                            "avg_score": (
-                                decision.get(
-                                    "avg_score"
-                                )
-                            ),
-                        },
-                    )
-
-                    verification_session.stage = (
-                        VerificationStage
-                        .FACE_RECOGNITION
-                    )
-
-                    await websocket.send_json(
-                        {
-                            "type": (
-                                "liveness_passed"
-                            ),
-                            "ok": True,
-                            "next_stage": (
-                                "face_recognition"
-                            ),
-                        }
-                    )
-
-                continue
-
-            # =================================================
-            # DECODE OPENCV FRAME
-            # =================================================
-
-            frame = decode_bgr(
-                image_bytes
-            )
-
-            if frame is None:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": (
-                            "cannot_decode_frame"
-                        ),
-                    }
-                )
-
-                continue
-
-            # =================================================
-            # STAGE 2 — FACE RECOGNITION
-            # =================================================
-
-            if (
-                verification_session.stage
-                == VerificationStage
-                .FACE_RECOGNITION
-            ):
-                try:
-                    verification = (
-                        await process_face_recognition(
-                            verification_session,
-                            frame,
-                            remaining,
-                        )
-                    )
-
-                except asyncio.TimeoutError:
-                    await handle_timeout()
-                    break
-
-                except ValueError:
-                    verification_session.face_match_count = 0
-
-                    await websocket.send_json(
-                        {
-                            "type": (
-                                "face_recognition"
-                            ),
-                            "verified": False,
-                            "identity_verified": (
-                                False
-                            ),
-                            "reason": (
-                                "face_not_detected"
-                            ),
-                            "match_count": 0,
-                            "required_matches": (
-                                FACE_MATCHES_REQUIRED
-                            ),
-                        }
-                    )
-
-                    continue
-
-                except Exception as exc:
-                    save_challenge_result(
-                        challenge=(
-                            "face_recognition"
-                        ),
-                        passed=False,
-                        reason=(
-                            "face_recognition_error"
-                        ),
-                        details={
-                            "error": str(
-                                exc
-                            ),
-                        },
-                    )
-
-                    await finish_verification(
-                        ok=False,
-                        reason=(
-                            "face_recognition_error"
-                        ),
-                    )
-
-                    break
-
-                identity_verified = (
-                    verification_session
-                    .identity_verified
-                )
-
-                response = {
-                    "type": (
-                        "face_recognition"
-                    ),
-                    "verified": (
-                        verification.get(
-                            "verified",
-                            False,
-                        )
-                    ),
-                    "identity_verified": (
-                        identity_verified
-                    ),
-                    "match_count": (
-                        verification_session
-                        .face_match_count
-                    ),
-                    "required_matches": (
-                        FACE_MATCHES_REQUIRED
-                    ),
-                    "distance": (
-                        verification.get(
-                            "distance"
-                        )
-                    ),
-                    "threshold": (
-                        verification.get(
-                            "threshold"
-                        )
-                    ),
+    try:
+        if not REFERENCE_IMAGE.is_file():
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": f"reference_image_not_found:{REFERENCE_IMAGE}",
                 }
+            )
+            return
 
-                # ---------------------------------------------
-                # FACE PASSED
-                # ---------------------------------------------
+        handler = StreamHandler(websocket)
 
-                if identity_verified:
-                    save_challenge_result(
-                        challenge=(
-                            "face_recognition"
-                        ),
-                        passed=True,
-                        reason="face_matched",
-                        details={
-                            "match_count": (
-                                verification_session
-                                .face_match_count
-                            ),
-                            "required_matches": (
-                                FACE_MATCHES_REQUIRED
-                            ),
-                            "distance": (
-                                verification.get(
-                                    "distance"
-                                )
-                            ),
-                            "threshold": (
-                                verification.get(
-                                    "threshold"
-                                )
-                            ),
-                        },
-                    )
-
-                    response[
-                        "next_stage"
-                    ] = "action"
-
-                    response[
-                        "action"
-                    ] = (
-                        verification_session
-                        .current_action
-                    )
-
-                await websocket.send_json(
-                    response
-                )
-
-                continue
-
-            # =================================================
-            # STAGE 3 — ONE ACTION ONLY
-            # =================================================
-
-            if (
-                verification_session.stage
-                == VerificationStage.ACTION
-            ):
-                current_action = (
-                    verification_session
-                    .current_action
-                )
-
-                # ---------------------------------------------
-                # NO ACTION
-                # ---------------------------------------------
-
-                if current_action is None:
-                    save_challenge_result(
-                        challenge="action",
-                        passed=False,
-                        reason=(
-                            "no_action_available"
-                        ),
-                    )
-
-                    await finish_verification(
-                        ok=False,
-                        reason=(
-                            "no_action_available"
-                        ),
-                    )
-
-                    break
-
-                try:
-                    action_result = (
-                        await process_face_action(
-                            verification_session,
-                            frame,
-                            remaining,
-                        )
-                    )
-
-                except asyncio.TimeoutError:
-                    await handle_timeout()
-                    break
-
-                except Exception as exc:
-                    save_challenge_result(
-                        challenge=(
-                            current_action
-                        ),
-                        passed=False,
-                        reason=(
-                            "face_action_error"
-                        ),
-                        details={
-                            "error": str(
-                                exc
-                            ),
-                        },
-                    )
-
-                    await finish_verification(
-                        ok=False,
-                        reason=(
-                            "face_action_error"
-                        ),
-                    )
-
-                    break
-
-                # Save count BEFORE
-                # complete_current_action()
-                # resets it.
-                matched_count = (
-                    verification_session
-                    .action_match_count
-                )
-
-                # ---------------------------------------------
-                # ACTION PASSED
-                # ---------------------------------------------
-
-                if (
-                    action_result.get(
-                        "ok",
-                        False,
-                    )
-                    and
-                    matched_count
-                    >= ACTION_MATCHES_REQUIRED
-                ):
-                    completed_action = (
-                        verification_session
-                        .complete_current_action()
-                    )
-
-                    save_challenge_result(
-                        challenge=(
-                            completed_action
-                            or current_action
-                        ),
-                        passed=True,
-                        reason=(
-                            "action_detected"
-                        ),
-                        details={
-                            "matches": (
-                                matched_count
-                            ),
-                            "required_matches": (
-                                ACTION_MATCHES_REQUIRED
-                            ),
-                            "analysis": (
-                                action_result.get(
-                                    "analysis"
-                                )
-                            ),
-                        },
-                    )
-
-                    # -----------------------------------------
-                    # Send last action progress
-                    # -----------------------------------------
-
-                    await websocket.send_json(
-                        {
-                            "type": (
-                                "action_result"
-                            ),
-                            "action": (
-                                current_action
-                            ),
-                            "detected": True,
-                            "match_count": (
-                                matched_count
-                            ),
-                            "required_matches": (
-                                ACTION_MATCHES_REQUIRED
-                            ),
-                            "action_completed": (
-                                True
-                            ),
-                            "completed_action": (
-                                completed_action
-                                or current_action
-                            ),
-                            "completed_actions": (
-                                verification_session
-                                .completed_actions
-                            ),
-                            "next_action": None,
-                            "analysis": (
-                                action_result.get(
-                                    "analysis"
-                                )
-                            ),
-                        }
-                    )
-
-                    # -----------------------------------------
-                    # ONE ACTION = DONE IMMEDIATELY
-                    # -----------------------------------------
-
-                    verification_session.stage = (
-                        VerificationStage.DONE
-                    )
-
-                    await finish_verification(
-                        ok=True,
-                        reason=(
-                            "verification_complete"
-                        ),
-                    )
-
-                    break
-
-                # ---------------------------------------------
-                # ACTION NOT COMPLETE YET
-                # ---------------------------------------------
-
-                await websocket.send_json(
-                    {
-                        "type": (
-                            "action_result"
-                        ),
-                        "action": (
-                            current_action
-                        ),
-                        "detected": bool(
-                            action_result.get(
-                                "ok",
-                                False,
-                            )
-                        ),
-                        "match_count": (
-                            matched_count
-                        ),
-                        "required_matches": (
-                            ACTION_MATCHES_REQUIRED
-                        ),
-                        "action_completed": (
-                            False
-                        ),
-                        "completed_action": None,
-                        "completed_actions": (
-                            verification_session
-                            .completed_actions
-                        ),
-                        "next_action": (
-                            current_action
-                        ),
-                        "analysis": (
-                            action_result.get(
-                                "analysis"
-                            )
-                        ),
-                    }
-                )
-
-                continue
-
-            # =================================================
-            # DONE
-            # =================================================
-
-            if (
-                verification_session.stage
-                == VerificationStage.DONE
-            ):
-                break
-
-    # ========================================================
-    # CLIENT DISCONNECTED
-    # ========================================================
+        await handler.run()
 
     except WebSocketDisconnect:
         pass
 
-    # ========================================================
-    # UNEXPECTED SERVER ERROR
-    # ========================================================
-
     except Exception as exc:
         try:
-            challenge = (
-                get_current_challenge()
-            )
-
-            save_challenge_result(
-                challenge=challenge,
-                passed=False,
-                reason="server_error",
-                details={
-                    "error": str(
-                        exc
-                    ),
-                },
-            )
-
-            await finish_verification(
-                ok=False,
-                reason="server_error",
-            )
-
+            if handler is not None:
+                await handler.fail(
+                    handler.current_challenge(),
+                    "server_error",
+                    {"error": str(exc)},
+                )
         except Exception:
             pass
-
-    # ========================================================
-    # CLOSE CONNECTION
-    # ========================================================
 
     finally:
+        state.active_sessions -= 1
+
         try:
             await websocket.close()
-
         except Exception:
             pass
+
+
 # ============================================================
 # HEALTH
 # ============================================================
@@ -1452,7 +802,8 @@ async def health():
     return {
         "ok": True,
         "runtime": get_runtime_info(),
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "active_sessions": app.state.active_sessions,
+        "max_sessions": settings.max_sessions,
+        "antispoof_batching": app.state.batcher.stats(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,6 @@ from typing import Any
 import cv2
 import mediapipe as mp
 import numpy as np
-from deepface import DeepFace
 
 
 @dataclass(slots=True)
@@ -41,6 +41,10 @@ class FaceActionAnalyzer:
 
     Left/right eye names refer to the PERSON'S anatomical left/right.
     If your preview is mirrored, the displayed sides will look reversed.
+
+    Thread-safe: a FaceLandmarker must not be called concurrently, so each
+    worker thread lazily gets its own instance. No global lock is needed and
+    sessions in the action stage no longer queue behind each other.
     """
 
     def __init__(
@@ -66,9 +70,15 @@ class FaceActionAnalyzer:
         self.pitch_threshold = float(pitch_threshold)
         self.invert_yaw = bool(invert_yaw)
 
+        self._model_path = str(model_path)
+        self._local = threading.local()
+        self._instances: list = []
+        self._instances_lock = threading.Lock()
+
+    def _create_landmarker(self):
         options = mp.tasks.vision.FaceLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(
-                model_asset_path=str(model_path),
+                model_asset_path=self._model_path,
             ),
             running_mode=mp.tasks.vision.RunningMode.IMAGE,
             num_faces=1,
@@ -79,12 +89,33 @@ class FaceActionAnalyzer:
             output_facial_transformation_matrixes=True,
         )
 
-        self._landmarker = (
-            mp.tasks.vision.FaceLandmarker.create_from_options(options)
-        )
+        return mp.tasks.vision.FaceLandmarker.create_from_options(options)
+
+    def _get_landmarker(self):
+        landmarker = getattr(self._local, "landmarker", None)
+
+        if landmarker is None:
+            landmarker = self._create_landmarker()
+            self._local.landmarker = landmarker
+
+            with self._instances_lock:
+                self._instances.append(landmarker)
+
+        return landmarker
+
+    def warmup(self) -> None:
+        """Create this thread's landmarker and run it once."""
+        self.analyze(np.zeros((240, 320, 3), dtype=np.uint8))
 
     def close(self) -> None:
-        self._landmarker.close()
+        with self._instances_lock:
+            instances, self._instances = self._instances, []
+
+        for landmarker in instances:
+            try:
+                landmarker.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> "FaceActionAnalyzer":
         return self
@@ -143,7 +174,7 @@ class FaceActionAnalyzer:
 
     def analyze(self, frame_bgr: np.ndarray) -> FaceActionResult:
         image = self._to_mediapipe_image(frame_bgr)
-        result = self._landmarker.detect(image)
+        result = self._get_landmarker().detect(image)
 
         if not result.face_landmarks:
             return FaceActionResult(face_found=False)
@@ -220,50 +251,6 @@ class FaceActionAnalyzer:
     def is_smiling(self, frame_bgr: np.ndarray) -> bool:
         result = self.analyze(frame_bgr)
         return result.face_found and result.smiling
-
-    # ---------------------------------------------------------
-    # Face recognition / verification
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def verify_face(
-        reference_image: str | Path | np.ndarray,
-        frame_bgr: np.ndarray,
-        *,
-        model_name: str = "Facenet512",
-        detector_backend: str = "retinaface",
-        distance_metric: str = "cosine",
-        threshold: float | None = None,
-    ) -> dict[str, Any]:
-        """
-        Compare a known/reference face against the current camera frame.
-
-        Do NOT call this on every video frame unless you really need to.
-        It is much heavier than MediaPipe action analysis.
-        """
-        result = DeepFace.verify(
-            img1_path=(
-                str(reference_image)
-                if isinstance(reference_image, Path)
-                else reference_image
-            ),
-            img2_path=frame_bgr,
-            model_name=model_name,
-            detector_backend=detector_backend,
-            distance_metric=distance_metric,
-            enforce_detection=True,
-            align=True,
-            threshold=threshold,
-        )
-
-        return {
-            "verified": bool(result.get("verified", False)),
-            "distance": float(result.get("distance", 0.0)),
-            "threshold": float(result.get("threshold", 0.0)),
-            "model": model_name,
-            "detector": detector_backend,
-            "metric": distance_metric,
-        }
 
     def check_action(
         self,
