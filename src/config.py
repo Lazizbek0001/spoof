@@ -23,7 +23,6 @@ def _float(name: str, default: float) -> float:
 @dataclass(frozen=True, slots=True)
 class Settings:
     api_key: str = os.getenv("API_KEY", "").strip()
-    reference_image: str = os.getenv("REFERENCE_IMAGE", "sample/5.jpg")
 
     max_connection_seconds: float = _float("MAX_CONNECTION_SECONDS", 60.0)
     max_sessions: int = _int("MAX_SESSIONS", 200)
@@ -43,8 +42,7 @@ class Settings:
     min_avg_score: float = 0.90
     required_real_ratio: float = 0.80
 
-    # Identity: consecutive matching frames needed, taken from the anti-spoof
-    # frames. Recognition stops once reached.
+    # Identity: consecutive matching frames, taken from the anti-spoof frames.
     face_matches_required: int = 3
     # Challenge: consecutive frames in which the action is detected.
     action_matches_required: int = 2

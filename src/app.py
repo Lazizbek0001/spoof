@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 
-from session import Session
-
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")  # TF shares the GPU with torch
@@ -13,36 +11,21 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from random import SystemRandom
 
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 from face_util.anti_spoof_infer import infer_antispoof_batch
 from face_util.gpu_utils import describe_runtime, get_runtime_info
 from src.batching import MicroBatcher
 from src.config import settings
 from src.face_actions import FaceActionAnalyzer
-from src.helpers import (
-    antispoof,
-    check_api_key,
-    decode_frame,
-    receive_message,
-    run_in_pool,
-    warmup_antispoof,
-    warmup_cpu_thread,
-)
-from src.liveness import LivenessSession
+from src.helpers import check_api_key, decode_frame, run_in_pool, warmup_antispoof, warmup_cpu_thread
 from src.recognition import FaceRecognizer
+from src.session import Session
 
-ROOT = Path(__file__).resolve().parent.parent
-LANDMARKER_MODEL = ROOT / "src" / "models" / "face_landmarker.task"
-REFERENCE_IMAGE = ROOT / settings.reference_image
-
-ACTIONS = ("turn_left", "turn_right", "close_left_eye", "close_right_eye", "smile")
-
-STAGE_ANTISPOOF = "antispoof"   # liveness + identity, from the same frames
-STAGE_ACTION = "action"         # one random challenge
+LANDMARKER_MODEL = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
 
 
 # ---------------------------------------------------------------- lifespan
@@ -74,8 +57,6 @@ async def lifespan(app: FastAPI):
         for _ in range(settings.cpu_workers)
     ))
     await loop.run_in_executor(recog_pool, state.recognizer.warmup)
-    if REFERENCE_IMAGE.is_file():
-        await loop.run_in_executor(recog_pool, state.recognizer.reference_embedding, REFERENCE_IMAGE)
     state.batcher.start()
     print(f"[startup] ready cpu_workers={settings.cpu_workers} max_batch={settings.max_batch}")
 
@@ -90,6 +71,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Liveness API", lifespan=lifespan)
 
+
+# ---------------------------------------------------------------- websocket
+
 @app.websocket("/ws/stream")
 async def ws_stream(websocket: WebSocket):
     if not await check_api_key(websocket, settings.api_key):
@@ -103,9 +87,6 @@ async def ws_stream(websocket: WebSocket):
     state.active_sessions += 1
     session = None
     try:
-        if not REFERENCE_IMAGE.is_file():
-            await websocket.send_json({"type": "error", "message": f"reference_image_not_found:{REFERENCE_IMAGE}"})
-            return
         session = Session(websocket)
         await session.run()
     except WebSocketDisconnect:
@@ -122,6 +103,34 @@ async def ws_stream(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------- enrollment
+
+class EmbedRequest(BaseModel):
+    image: str   # base64 JPEG/PNG (data: URL prefix allowed)
+
+
+@app.post("/embed")
+async def embed(body: EmbedRequest, x_api_key: str = Header(default="")):
+    """
+    Turn an enrollment photo into the reference vector the client later sends
+    over the websocket. Uses the same model as the stream, so vectors match.
+    """
+    if x_api_key != settings.api_key:
+        raise HTTPException(401, "Invalid API key")
+
+    state = app.state
+    frame = await run_in_pool(state.cpu_pool, decode_frame, body.image, timeout=10)
+    if frame is None:
+        raise HTTPException(400, "cannot_decode_image")
+    try:
+        vector = await run_in_pool(state.recog_pool, state.recognizer.embed, frame, timeout=30)
+    except ValueError:
+        raise HTTPException(422, "face_not_detected")
+
+    return {"model": state.recognizer.MODEL, "dim": state.recognizer.DIM, "embedding": vector.tolist()}
+
 
 
 @app.get("/health")

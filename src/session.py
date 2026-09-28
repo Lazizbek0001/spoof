@@ -1,22 +1,35 @@
+from __future__ import annotations
+
 import asyncio
 from random import SystemRandom
 
+import numpy as np
 from fastapi import WebSocket
 
-from app import ACTIONS, REFERENCE_IMAGE, STAGE_ACTION, STAGE_ANTISPOOF
-from liveness import LivenessSession
-from src.helpers import (
-    antispoof,
-    check_api_key,
-    decode_frame,
-    receive_message,
-    run_in_pool,
-    warmup_antispoof,
-    warmup_cpu_thread,
-)
 from src.config import settings
+from src.helpers import antispoof, decode_frame, receive_message, run_in_pool
+from src.liveness import LivenessSession
+
+ACTIONS = ("turn_left", "turn_right", "close_left_eye", "close_right_eye", "smile")
+
+STAGE_ANTISPOOF = "antispoof"   # liveness + identity, from the same frames
+STAGE_ACTION = "action"         # one random challenge
+
+MAX_REFERENCE_VECTORS = 10
+
 
 class Session:
+    """
+    Protocol (client -> server):
+      {"type": "reference", "embedding": [512 floats]}            one vector
+      {"type": "reference", "embeddings": [[...], [...]]}         several (best match wins)
+      {"type": "frame", "frame": "<base64 jpeg>", "session_id": "..."}   or raw JPEG bytes
+      {"type": "reset"} / {"type": "close"}
+
+    A reference must arrive before the first frame. It survives reset and
+    session_id changes; sending a new "reference" replaces it.
+    """
+
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.state = ws.app.state
@@ -24,6 +37,7 @@ class Session:
         self.started = self.loop.time()
         self.deadline = self.started + settings.max_connection_seconds
         self.session_id: str | None = None
+        self.references: np.ndarray | None = None   # (N, 512), normalised
         self.reset()
 
     def reset(self) -> None:
@@ -74,6 +88,29 @@ class Session:
     def passed(self, challenge: str, reason: str, **details) -> None:
         self.results[challenge] = {"passed": True, "reason": reason, "details": details}
 
+    # -- reference vectors ----------------------------------------------
+
+    def set_reference(self, message: dict) -> str | None:
+        """Returns an error code, or None on success."""
+        vectors = message.get("embeddings")
+        if vectors is None and message.get("embedding") is not None:
+            vectors = [message["embedding"]]
+        if not isinstance(vectors, list) or not vectors:
+            return "reference_missing_embedding"
+        if len(vectors) > MAX_REFERENCE_VECTORS:
+            return "too_many_embeddings"
+
+        recognizer = self.state.recognizer
+        try:
+            rows = [recognizer.normalize(v) for v in vectors]
+        except (ValueError, TypeError):
+            return "invalid_embedding"
+        if any(r.shape != (recognizer.DIM,) for r in rows):
+            return f"embedding_must_have_{recognizer.DIM}_values"
+
+        self.references = np.stack(rows)
+        return None
+
     # -- model calls ----------------------------------------------------
 
     async def check_liveness(self, frame) -> dict:
@@ -84,7 +121,7 @@ class Session:
         try:
             return await run_in_pool(
                 self.state.recog_pool, self.state.recognizer.verify,
-                str(REFERENCE_IMAGE), frame, timeout=self.remaining,
+                self.references, frame, timeout=self.remaining,
             )
         except ValueError:
             return None
@@ -104,8 +141,18 @@ class Session:
                     self.reset()
                     await self.send(type="reset_ok", stage=self.stage)
                     continue
+                if kind == "reference":
+                    error = self.set_reference(message)
+                    if error:
+                        await self.send(type="error", message=error)
+                    else:
+                        await self.send(type="reference_ok", count=len(self.references))
+                    continue
                 if kind != "frame":
                     await self.send(type="error", message=f"unknown_type:{kind}")
+                    continue
+                if self.references is None:
+                    await self.send(type="error", message="reference_required")
                     continue
 
                 # Binary frames carry no session id: keep the current one.
@@ -224,5 +271,3 @@ class Session:
         self.passed(self.action, "action_detected", matches=self.action_matches)
         await self.final(True, "verification_complete")
         return True
-
-
