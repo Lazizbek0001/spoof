@@ -14,7 +14,8 @@ WORKDIR /app
 
 # Dependencies layer (~9 GB) is rebuilt only when requirements-gpu.txt changes.
 COPY requirements-gpu.txt .
-RUN pip install -r requirements-gpu.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --timeout 120 --retries 10 -r requirements-gpu.txt
 
 # Bake DeepFace weights into the image so pods never download at startup.
 RUN python -c "from deepface import DeepFace; DeepFace.build_model('Facenet512'); \
