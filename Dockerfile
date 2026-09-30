@@ -22,8 +22,9 @@ WORKDIR /app
 
 COPY requirements-gpu.txt .
 
-RUN --mount=type=bind,source=wheels,target=/wheels,readonly \
+RUN --mount=type=bind,from=wheels,target=/wheels,readonly \
     pip install \
+      --no-cache-dir \
       --no-index \
       --find-links=/wheels \
       -r requirements-gpu.txt
